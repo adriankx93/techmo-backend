@@ -1,189 +1,89 @@
-require("dotenv").config();
 const express = require("express");
-const sqlite3 = require("sqlite3").verbose();
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const { Parser } = require("json2csv");
-const twilio = require("twilio");
-const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 
 const app = express();
-const db = new sqlite3.Database("db.sqlite");
 app.use(cors());
 app.use(bodyParser.json());
 
-// Tabele
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    desc TEXT,
-    type TEXT,
-    done INTEGER,
-    remark TEXT,
-    missing TEXT,
-    assignedTo TEXT
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS defects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    desc TEXT,
-    status TEXT,
-    reportedBy TEXT,
-    priority TEXT,
-    location TEXT,
-    imageUrl TEXT,
-    comment TEXT
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS materials (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action TEXT,
-    user TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-});
+// --- DEMO baza użytkowników (login: admin / hasło: test1234)
+const USERS = [
+  { username: "admin", password: "test1234", name: "Administrator" },
+  { username: "tech1", password: "pass1", name: "Technik Jan" }
+];
 
-function logAction(action, user = "system") {
-  db.run("INSERT INTO logs (action, user) VALUES (?, ?)", [action, user]);
+// --- DEMO baza danych (RAM)
+let tasks = [
+  { id: 1, desc: "Sprawdzenie systemu SAP", type: "dzienna", done: false, remark: "", assignedTo: "" },
+  { id: 2, desc: "Przegląd centrali wentylacyjnej", type: "nocna", done: true, remark: "OK", assignedTo: "Jan" },
+];
+let defects = [
+  { id: 1, desc: "Wyciek przy kotle", status: "zgłoszona", priority: "wysoki", location: "Kotłownia" },
+  { id: 2, desc: "Drzwi się nie domykają", status: "usunięta", priority: "średni", location: "Magazyn" },
+];
+let materials = [
+  { id: 1, name: "Uszczelka 16mm" },
+  { id: 2, name: "Filtr F7" }
+];
+
+// --- Funkcja tworząca "token" (nieprawdziwy JWT, ale wystarczy do frontendu)
+function makeToken(username) {
+  return Buffer.from(username + "|" + Date.now()).toString("base64");
+}
+function checkToken(token) {
+  if (!token) return null;
+  try {
+    const decoded = Buffer.from(token, "base64").toString();
+    const [username] = decoded.split("|");
+    return USERS.find(u => u.username === username);
+  } catch { return null; }
 }
 
-// Zadania
-app.get("/tasks", (req, res) => {
-  db.all("SELECT * FROM tasks", (err, rows) => res.json(rows));
-});
-app.post("/tasks", (req, res) => {
-  const { desc, type, assignedTo, user } = req.body;
-  db.run(
-    "INSERT INTO tasks (desc, type, done, remark, missing, assignedTo) VALUES (?, ?, 0, '', '', ?)",
-    [desc, type, assignedTo || ""],
-    function (err) {
-      logAction(`Dodano zadanie: ${desc}`, user || "Nieznany");
-      res.json({ id: this.lastID });
-    }
-  );
-});
-app.put("/tasks/:id", (req, res) => {
-  const { done, remark, missing, assignedTo, user } = req.body;
-  db.run(
-    "UPDATE tasks SET done=?, remark=?, missing=?, assignedTo=? WHERE id=?",
-    [done ? 1 : 0, remark, missing, assignedTo || "", req.params.id],
-    function (err) {
-      logAction(
-        `Edytowano zadanie [${req.params.id}], status: ${done ? "wykonano" : "nie wykonano"}`,
-        user || "Nieznany"
-      );
-      res.json({ updated: true });
-    }
-  );
+// --- Logowanie użytkownika
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+  const user = USERS.find(u => u.username === username && u.password === password);
+  if (!user) return res.status(401).json({ error: "Nieprawidłowe dane logowania" });
+  const token = makeToken(user.username);
+  res.json({ token, user: { name: user.name, username: user.username } });
 });
 
-// Usterki
-app.get("/defects", (req, res) => {
-  db.all("SELECT * FROM defects", (err, rows) => res.json(rows));
-});
-app.post("/defects", (req, res) => {
-  const { desc, reportedBy, priority, location, imageUrl, comment } = req.body;
-  db.run(
-    "INSERT INTO defects (desc, status, reportedBy, priority, location, imageUrl, comment) VALUES (?, 'zgłoszona', ?, ?, ?, ?, ?)",
-    [desc, reportedBy, priority || "średni", location || "", imageUrl || "", comment || ""],
-    function (err) {
-      logAction(`Dodano usterkę: ${desc}`, reportedBy || "Nieznany");
-      if (priority === "wysoki" && process.env.ALERT_PHONE) {
-        twilioClient.messages.create({
-          body: `ALERT! Nowa krytyczna usterka: ${desc} (${location || "Brak lokalizacji"})`,
-          from: process.env.TWILIO_PHONE,
-          to: process.env.ALERT_PHONE
-        });
-      }
-      res.json({ id: this.lastID });
-    }
-  );
-});
-app.put("/defects/:id", (req, res) => {
-  const { status, user } = req.body;
-  db.run(
-    "UPDATE defects SET status=? WHERE id=?",
-    [status, req.params.id],
-    function (err) {
-      logAction(`Zmieniono status usterki [${req.params.id}]: ${status}`, user || "Nieznany");
-      res.json({ updated: true });
-    }
-  );
+// --- Middleware autoryzacji
+function auth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : h;
+  const user = checkToken(token);
+  if (!user) return res.status(401).json({ error: "Brak autoryzacji" });
+  req.user = user;
+  next();
+}
+
+// --- Zadania
+app.get("/tasks", auth, (req, res) => res.json(tasks));
+app.put("/tasks/:id", auth, (req, res) => {
+  const id = +req.params.id;
+  tasks = tasks.map(t => t.id === id ? { ...t, ...req.body } : t);
+  res.json(tasks.find(t => t.id === id));
 });
 
-// Materiały
-app.get("/materials", (req, res) => {
-  db.all("SELECT * FROM materials", (err, rows) => res.json(rows));
-});
-app.post("/materials", (req, res) => {
-  const { name, user } = req.body;
-  db.run("INSERT OR IGNORE INTO materials (name) VALUES (?)", [name], function (err) {
-    logAction(`Zgłoszono brak materiału: ${name}`, user || "Nieznany");
-    res.json({ id: this.lastID });
-  });
-});
-app.delete("/materials/:id", (req, res) => {
-  db.run("DELETE FROM materials WHERE id=?", [req.params.id], function (err) {
-    logAction(`Usunięto materiał o id ${req.params.id}`);
-    res.json({ deleted: true });
-  });
+// --- Usterki
+app.get("/defects", auth, (req, res) => res.json(defects));
+app.put("/defects/:id", auth, (req, res) => {
+  const id = +req.params.id;
+  defects = defects.map(d => d.id === id ? { ...d, ...req.body } : d);
+  res.json(defects.find(d => d.id === id));
 });
 
-// Logi
-app.get("/logs", (req, res) => {
-  db.all("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100", (err, rows) => res.json(rows));
+// --- Materiały
+app.get("/materials", auth, (req, res) => res.json(materials));
+app.delete("/materials/:id", auth, (req, res) => {
+  const id = +req.params.id;
+  materials = materials.filter(m => m.id !== id);
+  res.json({ ok: true });
 });
 
-// Raporty
-app.get("/report/tasks.csv", (req, res) => {
-  db.all("SELECT * FROM tasks", (err, rows) => {
-    const parser = new Parser();
-    const csv = parser.parse(rows);
-    res.header("Content-Type", "text/csv");
-    res.attachment("tasks_report.csv");
-    res.send(csv);
-  });
+// --- Serwer
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log("CMMS backend running on port", PORT);
 });
-app.get("/report/defects.csv", (req, res) => {
-  db.all("SELECT * FROM defects", (err, rows) => {
-    const parser = new Parser();
-    const csv = parser.parse(rows);
-    res.header("Content-Type", "text/csv");
-    res.attachment("defects_report.csv");
-    res.send(csv);
-  });
-});
-
-// QR zgłoszenia
-app.post("/defects/qr", (req, res) => {
-  const { qrLocation, desc, reportedBy, priority } = req.body;
-  db.run(
-    "INSERT INTO defects (desc, status, reportedBy, priority, location) VALUES (?, 'zgłoszona', ?, ?, ?)",
-    [desc, reportedBy || "QR-User", priority || "średni", qrLocation || "QR"],
-    function (err) {
-      logAction(`Usterka przez QR: ${desc} (${qrLocation})`, reportedBy || "QR-User");
-      res.json({ id: this.lastID });
-    }
-  );
-});
-
-// Webhook IoT
-app.post("/iot-webhook", (req, res) => {
-  const { type, desc, location } = req.body;
-  if (type && desc) {
-    db.run(
-      "INSERT INTO defects (desc, status, reportedBy, priority, location) VALUES (?, 'zgłoszona', 'IoT', 'wysoki', ?)",
-      [`[IoT] ${desc}`, location || ""],
-      function (err) {
-        logAction(`Usterka z IoT: ${desc} (${location})`, "IoT");
-        res.json({ id: this.lastID });
-      }
-    );
-  } else {
-    res.status(400).json({ error: "type & desc required" });
-  }
-});
-
-app.listen(4000, () => console.log("API działa na http://localhost:4000"));
