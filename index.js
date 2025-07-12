@@ -1,89 +1,154 @@
-const express = require("express");
-const cors = require("cors");
-const bodyParser = require("body-parser");
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const adminRoutes = require('./routes/admin');
+const taskRoutes = require('./routes/tasks');
+const defectRoutes = require('./routes/defects');
+const materialRoutes = require('./routes/materials');
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
 
-// --- DEMO baza użytkowników (login: admin / hasło: test1234)
-const USERS = [
-  { username: "admin", password: "test1234", name: "Administrator" },
-  { username: "tech1", password: "pass1", name: "Technik Jan" }
-];
+// Security middleware
+app.use(helmet());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 
-// --- DEMO baza danych (RAM)
-let tasks = [
-  { id: 1, desc: "Sprawdzenie systemu SAP", type: "dzienna", done: false, remark: "", assignedTo: "" },
-  { id: 2, desc: "Przegląd centrali wentylacyjnej", type: "nocna", done: true, remark: "OK", assignedTo: "Jan" },
-];
-let defects = [
-  { id: 1, desc: "Wyciek przy kotle", status: "zgłoszona", priority: "wysoki", location: "Kotłownia" },
-  { id: 2, desc: "Drzwi się nie domykają", status: "usunięta", priority: "średni", location: "Magazyn" },
-];
-let materials = [
-  { id: 1, name: "Uszczelka 16mm" },
-  { id: 2, name: "Filtr F7" }
-];
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Zbyt wiele żądań z tego IP, spróbuj ponownie później.'
+});
+app.use('/api/', limiter);
 
-// --- Funkcja tworząca "token" (nieprawdziwy JWT, ale wystarczy do frontendu)
-function makeToken(username) {
-  return Buffer.from(username + "|" + Date.now()).toString("base64");
-}
-function checkToken(token) {
-  if (!token) return null;
+// Stricter rate limiting for auth routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: 'Zbyt wiele prób logowania, spróbuj ponownie później.'
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/cmms_db', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => {
+  console.log('Connected to MongoDB');
+  
+  // Create default admin user if none exists
+  createDefaultAdmin();
+})
+.catch((error) => {
+  console.error('MongoDB connection error:', error);
+  process.exit(1);
+});
+
+// Create default admin user
+async function createDefaultAdmin() {
   try {
-    const decoded = Buffer.from(token, "base64").toString();
-    const [username] = decoded.split("|");
-    return USERS.find(u => u.username === username);
-  } catch { return null; }
+    const User = require('./models/User');
+    const adminExists = await User.findOne({ role: 'admin' });
+    
+    if (!adminExists) {
+      const admin = new User({
+        email: 'admin@cmms.com',
+        password: 'admin123',
+        firstName: 'Administrator',
+        lastName: 'Systemu',
+        role: 'admin',
+        status: 'active',
+        department: 'IT'
+      });
+      
+      await admin.save();
+      console.log('Default admin user created:');
+      console.log('Email: admin@cmms.com');
+      console.log('Password: admin123');
+      console.log('Please change the password after first login!');
+    }
+  } catch (error) {
+    console.error('Error creating default admin:', error);
+  }
 }
 
-// --- Logowanie użytkownika
-app.post("/login", (req, res) => {
-  const { username, password } = req.body;
-  const user = USERS.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ error: "Nieprawidłowe dane logowania" });
-  const token = makeToken(user.username);
-  res.json({ token, user: { name: user.name, username: user.username } });
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/tasks', taskRoutes);
+app.use('/api/defects', defectRoutes);
+app.use('/api/materials', materialRoutes);
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
-// --- Middleware autoryzacji
-function auth(req, res, next) {
-  const h = req.headers.authorization || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7) : h;
-  const user = checkToken(token);
-  if (!user) return res.status(401).json({ error: "Brak autoryzacji" });
-  req.user = user;
-  next();
-}
-
-// --- Zadania
-app.get("/tasks", auth, (req, res) => res.json(tasks));
-app.put("/tasks/:id", auth, (req, res) => {
-  const id = +req.params.id;
-  tasks = tasks.map(t => t.id === id ? { ...t, ...req.body } : t);
-  res.json(tasks.find(t => t.id === id));
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Error:', error);
+  
+  if (error.name === 'ValidationError') {
+    const errors = Object.values(error.errors).map(err => err.message);
+    return res.status(400).json({ error: 'Błędy walidacji', details: errors });
+  }
+  
+  if (error.name === 'CastError') {
+    return res.status(400).json({ error: 'Nieprawidłowy format ID' });
+  }
+  
+  if (error.code === 11000) {
+    const field = Object.keys(error.keyValue)[0];
+    return res.status(400).json({ error: `${field} już istnieje` });
+  }
+  
+  res.status(500).json({ error: 'Wewnętrzny błąd serwera' });
 });
 
-// --- Usterki
-app.get("/defects", auth, (req, res) => res.json(defects));
-app.put("/defects/:id", auth, (req, res) => {
-  const id = +req.params.id;
-  defects = defects.map(d => d.id === id ? { ...d, ...req.body } : d);
-  res.json(defects.find(d => d.id === id));
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint nie istnieje' });
 });
 
-// --- Materiały
-app.get("/materials", auth, (req, res) => res.json(materials));
-app.delete("/materials/:id", auth, (req, res) => {
-  const id = +req.params.id;
-  materials = materials.filter(m => m.id !== id);
-  res.json({ ok: true });
-});
-
-// --- Serwer
+// Start server
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log("CMMS backend running on port", PORT);
+  console.log(`CMMS Backend running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  mongoose.connection.close(() => {
+    console.log('MongoDB connection closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully');
+  mongoose.connection.close(() => {
+    console.log('MongoDB connection closed');
+    process.exit(0);
+  });
 });
